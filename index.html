@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebGPU Hydro Sphere TSL</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            background: #000; 
+            overflow: hidden; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            touch-action: none; 
+        }
+        #canvas-container { width: 100vw; height: 100vh; }
+        
+        /* Dashboard Overlay */
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        .hud-panel {
+            background: rgba(10, 20, 30, 0.6);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            padding: 16px;
+            border-radius: 16px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #fff;
+            width: 220px;
+            pointer-events: auto;
+        }
+        h1 { font-size: 14px; font-weight: 600; margin-bottom: 8px; letter-spacing: 0.5px; opacity: 0.9; }
+        .stat-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; opacity: 0.7; }
+        .stat-value { font-family: 'Courier New', monospace; font-weight: bold; color: #00aaff; }
+        
+        /* Start Button */
+        #start-overlay {
+            position: absolute; inset: 0;
+            background: rgba(0,0,0,0.85);
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            z-index: 99; transition: opacity 0.5s;
+        }
+        button {
+            background: #00aaff; color: #000; border: none;
+            padding: 16px 32px; border-radius: 30px;
+            font-size: 16px; font-weight: bold; cursor: pointer;
+            box-shadow: 0 0 20px rgba(0, 170, 255, 0.4);
+        }
+    </style>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+
+<div id="ui-layer">
+    <div class="hud-panel">
+        <h1>HYDRO ENGINE // TSL</h1>
+        <div class="stat-row"><span>FPS</span><span id="fps" class="stat-value">60</span></div>
+        <div class="stat-row"><span>AUDIO</span><span id="audio-val" class="stat-value">0.00</span></div>
+        <div class="stat-row"><span>GPU</span><span class="stat-value">WebGPU</span></div>
+    </div>
+</div>
+
+<div id="start-overlay">
+    <button id="start-btn">TAP TO INITIALIZE</button>
+    <p style="color:#666; margin-top:15px; font-size:12px">Microphone Access Required</p>
+</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/",
+        "three/tsl": "https://unpkg.com/three@0.170.0/examples/jsm/nodes/Nodes.js"
+    }
+}
+</script>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { WebGPURenderer } from 'three/addons/renderers/webgpu/WebGPURenderer.js';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { 
+        timerLocal, vec3, color, positionLocal, normalLocal, 
+        mix, sin, cos, dot, max, pow, float, uniform, uv, mul, add
+    } from 'three/tsl';
+
+    // -- CONFIG --
+    let renderer, scene, camera, controls;
+    let audioContext, analyser, dataArray;
+    let isAudioActive = false;
+    
+    // TSL Uniforms
+    const uAudio = uniform(0.0); // Drive visuals with this
+    
+    // -- INIT --
+    async function init() {
+        if (!navigator.gpu) {
+            alert("WebGPU not supported on this browser.");
+            return;
+        }
+
+        renderer = new WebGPURenderer({ antialias: true, powerPreference: "high-performance" });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000205);
+
+        camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 0, 3.5);
+
+        controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.autoRotate = true;
+        controls.autoRotateSpeed = 1.0;
+        controls.enablePan = false;
+
+        // -- LIGHTING --
+        const ambient = new THREE.AmbientLight(0x404040, 2.0);
+        scene.add(ambient);
+        
+        const dirLight = new THREE.DirectionalLight(0xffffff, 3.0);
+        dirLight.position.set(2, 5, 5);
+        scene.add(dirLight);
+
+        // -- TSL SHADER GRAPH --
+        // 1. Time & Pos
+        const t = timerLocal(0.4);
+        const pos = positionLocal.toVar();
+        
+        // 2. Audio-Reactive Noise
+        // We modulate frequency and amplitude based on uAudio
+        const freq = uAudio.mul(2.0).add(4.0);
+        const amp = uAudio.mul(0.2).add(0.1);
+
+        // Layered Wave Noise
+        const waveA = sin(pos.mul(freq).add(t));
+        const waveB = cos(pos.mul(freq.mul(1.5)).sub(t.mul(1.2)));
+        
+        // Final displacement value
+        const displacement = waveA.mul(waveB).mul(amp);
+        
+        // 3. Apply Displacement to Vertex Position
+        const newPos = positionLocal.add(normalLocal.mul(displacement));
+
+        // 4. Color Logic
+        const deepColor = color(0x001a33);
+        const shallowColor = color(0x0088ff);
+        const foamColor = color(0xffffff);
+
+        // Mix based on displacement height
+        const waterMix = mix(deepColor, shallowColor, displacement.add(0.2).mul(3.0));
+        
+        // Fresnel (Rim Lighting)
+        const viewVec = camera.position.sub(newPos).normalize();
+        const fresnel = float(1.0).sub(dot(normalLocal, vec3(0,0,1))).clamp(0, 1).pow(3.0);
+        
+        // Final Color Combine
+        const finalColor = mix(waterMix, foamColor, fresnel.mul(0.6).add(uAudio.mul(0.2)));
+
+        // -- MATERIAL --
+        const material = new THREE.MeshPhysicalNodeMaterial({
+            colorNode: finalColor,
+            positionNode: newPos,
+            roughness: 0.1,
+            metalness: 0.1,
+            transmission: 0.2, // Glassy look
+            thickness: 1.5,
+            clearcoat: 1.0
+        });
+
+        // -- MESH --
+        const geometry = new THREE.SphereGeometry(1, 128, 128);
+        const sphere = new THREE.Mesh(geometry, material);
+        scene.add(sphere);
+
+        // -- LOOP --
+        renderer.setAnimationLoop(render);
+    }
+
+    // -- AUDIO SETUP --
+    async function setupAudio() {
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const source = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 64;
+            source.connect(analyser);
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            isAudioActive = true;
+            
+            // Resume context if suspended (common on iOS)
+            if (audioContext.state === 'suspended') {
+                await audioContext.resume();
+            }
+        } catch (e) {
+            console.error("Audio denied or error", e);
+            document.getElementById('audio-val').innerText = "OFF";
+        }
+    }
+
+    // -- RENDER LOOP --
+    let lastTime = 0;
+    let frames = 0;
+    
+    function render() {
+        controls.update();
+
+        // Update Audio Data
+        if (isAudioActive && analyser) {
+            analyser.getByteFrequencyData(dataArray);
+            
+            // Calculate average volume
+            let sum = 0;
+            for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+            const avg = sum / dataArray.length;
+            
+            // Smooth value
+            const normalized = Math.min(avg / 100, 1.0); 
+            const current = uAudio.value;
+            uAudio.value = current + (normalized - current) * 0.1; // Lerp for smoothness
+
+            // Update UI
+            document.getElementById('audio-val').innerText = uAudio.value.toFixed(2);
+        }
+
+        // FPS Counter
+        frames++;
+        const now = performance.now();
+        if (now - lastTime >= 1000) {
+            document.getElementById('fps').innerText = frames;
+            frames = 0;
+            lastTime = now;
+        }
+
+        renderer.render(scene, camera);
+    }
+
+    // -- HANDLERS --
+    document.getElementById('start-btn').addEventListener('click', async () => {
+        document.getElementById('start-overlay').style.opacity = 0;
+        setTimeout(() => document.getElementById('start-overlay').remove(), 500);
+        await init();
+        await setupAudio();
+    });
+
+    window.addEventListener('resize', () => {
+        if (!camera || !renderer) return;
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+</script>
+</body>
+</html>
